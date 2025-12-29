@@ -7,6 +7,7 @@ import subprocess
 import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import numpy as np
@@ -30,7 +31,7 @@ OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
 
 
 # -----------------------------
-# OS / subprocess helpers
+# helpers
 # -----------------------------
 def run(cmd: list[str]) -> None:
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -43,7 +44,7 @@ def safe_get(url, params=None, timeout=25):
         url,
         params=params,
         timeout=timeout,
-        headers={"User-Agent": "arg-analogue-horror/1.0 (github actions)"},
+        headers={"User-Agent": "arg-analogue-horror/1.1 (github actions)"},
         allow_redirects=True
     )
     r.raise_for_status()
@@ -62,6 +63,7 @@ def load_config():
 
 def now_seed():
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    # deterministic per run, but different each run
     seed = (int(stamp[-8:]) ^ random.randint(0, 2**31 - 1)) & 0xFFFFFFFF
     return stamp, seed
 
@@ -77,28 +79,35 @@ def pick_font(size=22):
     return ImageFont.load_default()
 
 
+def wrap_text(s, width=56):
+    return textwrap.fill(s, width=width)
+
+
 # -----------------------------
-# Online fetch (safe-ish sources)
+# online fetch (permissive-ish)
 # -----------------------------
-def fetch_wikimedia_images(n=10):
+def fetch_wikimedia_images(n=8):
     """
-    Fetch random Wikimedia Commons File pages and keep only permissive-ish licenses
-    AND only file types we can actually use in the pipeline.
+    Fetch random Commons files. We only accept mime types we can decode reliably in CI.
     """
     imgs = []
     tries = 0
-    while len(imgs) < n and tries < n * 8:
+    while len(imgs) < n and tries < n * 10:
         tries += 1
         params = {
             "action": "query",
             "format": "json",
             "generator": "random",
-            "grnnamespace": 6,   # File:
+            "grnnamespace": 6,  # File:
             "grnlimit": 1,
             "prop": "imageinfo",
             "iiprop": "url|mime|extmetadata",
         }
-        data = safe_get(WIKIMEDIA_API, params=params).json()
+        try:
+            data = safe_get(WIKIMEDIA_API, params=params).json()
+        except Exception:
+            continue
+
         pages = (data.get("query") or {}).get("pages") or {}
         for _, page in pages.items():
             ii = (page.get("imageinfo") or [{}])[0]
@@ -107,12 +116,8 @@ def fetch_wikimedia_images(n=10):
             meta = ii.get("extmetadata") or {}
             lic = (meta.get("LicenseShortName") or {}).get("value", "")
 
-            # license allowlist (you can tweak)
             allowed_license = any(x in lic for x in ["CC0", "Public domain", "CC BY", "CC-BY", "CC BY-SA", "CC-BY-SA"])
-
-            # file type allowlist: keep only things we can reliably open with Pillow on CI
-            # (SVG/TIFF often break; WEBP is usually OK, but depends on Pillow build—CI usually supports it.)
-            allowed_mime = any(x in mime for x in ["image/jpeg", "image/png", "image/webp"])
+            allowed_mime = mime in ("image/jpeg", "image/png")  # keep it simple + reliable
 
             if url and allowed_license and allowed_mime:
                 imgs.append({"url": url, "license": lic, "mime": mime})
@@ -120,19 +125,15 @@ def fetch_wikimedia_images(n=10):
 
 
 def download_image(url: str, out_path: Path) -> None:
-    """
-    Download an image and validate it's actually decodable (not HTML, not error page).
-    """
     r = safe_get(url, timeout=30)
     ctype = (r.headers.get("Content-Type") or "").lower()
 
-    # guard against being served HTML/JSON error pages
     if "text/html" in ctype or "application/json" in ctype:
-        raise RuntimeError(f"Non-image response for {url} (Content-Type={ctype})")
+        raise RuntimeError(f"Non-image response (Content-Type={ctype})")
 
     out_path.write_bytes(r.content)
 
-    # validate image readability
+    # verify decodable
     try:
         with Image.open(out_path) as im:
             im.verify()
@@ -141,10 +142,10 @@ def download_image(url: str, out_path: Path) -> None:
             out_path.unlink(missing_ok=True)
         except Exception:
             pass
-        raise RuntimeError(f"Downloaded file is not a readable image: {url} -> {e}")
+        raise RuntimeError(f"Unreadable image: {e}")
 
 
-def fetch_wikipedia_snippets(n=8):
+def fetch_wikipedia_snippets(n=6):
     snippets = []
     for _ in range(n):
         try:
@@ -181,7 +182,7 @@ def pseudo_traffic(seed):
 
 
 # -----------------------------
-# VHS / glitch effects
+# VHS effects (kept lightweight)
 # -----------------------------
 def add_scanlines(img: Image.Image, alpha=0.15):
     w, h = img.size
@@ -210,27 +211,23 @@ def chroma_shift(img: Image.Image, px=2):
 def tracking_tear(img: Image.Image):
     w, h = img.size
     y = random.randint(80, h - 120)
-    band_h = random.randint(18, 80)
-    dx = random.randint(-40, 40)
+    band_h = random.randint(18, 70)
+    dx = random.randint(-35, 35)
     band = img.crop((0, y, w, y + band_h))
     img.paste(band, (dx, y))
     return img
 
 
 def vhs_overlay(img: Image.Image, t, fps, label="CH-03"):
-    w, h = img.size
     draw = ImageDraw.Draw(img)
     f1 = pick_font(18)
-
-    draw.rectangle((14, 14, 380, 135), fill=(0, 0, 0))
+    draw.rectangle((14, 14, 390, 135), fill=(0, 0, 0))
     sec = int(t)
     frame = int((t - sec) * fps)
     timecode = f"{(sec//3600)%24:02d}:{(sec//60)%60:02d}:{sec%60:02d}:{frame:02d}"
-
     signal = random.randint(18, 99)
-    bitrate = random.randint(120, 520)
+    bitrate = random.randint(140, 560)
     err = random.randint(1, 9) if random.random() < 0.10 else 0
-
     lines = [
         "REC   VCR:PLAY",
         f"TC {timecode}  {label}",
@@ -244,12 +241,8 @@ def vhs_overlay(img: Image.Image, t, fps, label="CH-03"):
     return img
 
 
-def wrap_text(s, width=56):
-    return textwrap.fill(s, width=width)
-
-
 # -----------------------------
-# Cards / scenes
+# scene cards
 # -----------------------------
 def make_card(w, h, title, body, danger=False):
     img = Image.new("RGB", (w, h), (5, 8, 10))
@@ -266,14 +259,6 @@ def make_card(w, h, title, body, danger=False):
         draw.text((70, y), line, font=f_body, fill=(210, 255, 245))
         y += 30
     return img
-
-
-def safe_open_image(path: Path) -> Image.Image:
-    """
-    Open an image robustly. If it's broken, raise.
-    """
-    with Image.open(path) as im:
-        return im.convert("RGB")
 
 
 def missing_person_card(w, h, face_img: Image.Image, seed, location_name="UNKNOWN"):
@@ -318,11 +303,9 @@ def weather_traffic_crawl(weather, traffic):
 
 
 # -----------------------------
-# Main render
+# main render
 # -----------------------------
 def render_video(config):
-    ensure_dirs()
-
     stamp, seed = now_seed()
     random.seed(seed)
     np.random.seed(seed)
@@ -332,7 +315,7 @@ def render_video(config):
     w, h = int(config["width"]), int(config["height"])
     total = int(dur * fps)
 
-    # fresh work dir each run
+    # clean work each run (keeps “always different” honest)
     if WORK.exists():
         shutil.rmtree(WORK)
     ensure_dirs()
@@ -341,37 +324,52 @@ def render_video(config):
     weather = fetch_weather(config["lat"], config["lon"])
     traffic = pseudo_traffic(seed)
     crawl = weather_traffic_crawl(weather, traffic)
-    snippets = fetch_wikipedia_snippets(int(config.get("fetch_text_snippets", 8)))
+    snippets = fetch_wikipedia_snippets(int(config.get("fetch_text_snippets", 6)))
 
-    img_meta = fetch_wikimedia_images(int(config.get("fetch_images", 10)))
-
+    # fetch + parallel download
+    img_meta = fetch_wikimedia_images(int(config.get("fetch_images", 6)))
     downloaded: list[Path] = []
-    for i, m in enumerate(img_meta):
-        url = m["url"]
-        # keep original extension if we can
+
+    def dl_task(i, url):
         ext = os.path.splitext(url.split("?")[0])[1].lower()
-        if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
-            # fallback extension doesn't matter; we validate after download anyway
+        if ext not in [".jpg", ".jpeg", ".png"]:
             ext = ".jpg"
         out_path = ASSETS / f"img_{i:02d}{ext}"
-        try:
-            download_image(url, out_path)
-            downloaded.append(out_path)
-        except Exception:
-            continue
+        download_image(url, out_path)
+        return out_path
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        futures = []
+        for i, m in enumerate(img_meta):
+            futures.append(ex.submit(dl_task, i, m["url"]))
+        for fut in as_completed(futures):
+            try:
+                downloaded.append(fut.result())
+            except Exception:
+                continue
 
     if not downloaded:
-        # hard fallback: generate a noise image
         noise = Image.fromarray(np.random.randint(0, 255, (h, w, 3), dtype=np.uint8))
         p = ASSETS / "fallback.png"
         noise.save(p)
         downloaded = [p]
 
-    # choose face source
+    # preload and resize backgrounds ONCE (huge speed gain)
+    preloaded_bg: list[Image.Image] = []
+    for p in downloaded:
+        try:
+            with Image.open(p) as im:
+                preloaded_bg.append(im.convert("RGB").resize((w, h)))
+        except Exception:
+            continue
+    if not preloaded_bg:
+        preloaded_bg = [Image.fromarray(np.random.randint(0, 255, (h, w, 3), dtype=np.uint8))]
+
+    # face source
     if USER_IMAGE.exists():
         base_face = Image.open(USER_IMAGE).convert("RGB")
     else:
-        base_face = safe_open_image(downloaded[0])
+        base_face = preloaded_bg[0].copy()
 
     missing = missing_person_card(w, h, base_face, seed, config.get("location_name", "UNKNOWN"))
     entity = make_card(
@@ -409,16 +407,9 @@ def render_video(config):
             return "ERROR"
         return "END"
 
-    def open_any_valid(paths: list[Path]) -> Image.Image:
-        for p in reversed(paths):
-            try:
-                return safe_open_image(p)
-            except Exception:
-                continue
-        return Image.fromarray(np.random.randint(0, 255, (h, w, 3), dtype=np.uint8))
-
+    # jumpscare frame
     def make_jumpscare():
-        img = open_any_valid(downloaded).resize((w, h))
+        img = preloaded_bg[-1].copy()
         img = ImageEnhance.Contrast(img).enhance(2.2)
         img = ImageEnhance.Color(img).enhance(0.15)
         img = img.filter(ImageFilter.DETAIL)
@@ -430,28 +421,28 @@ def render_video(config):
 
     jumpscare = make_jumpscare()
 
-    # render frames
+    # render frames as JPG (fast!)
+    if FRAMES.exists():
+        shutil.rmtree(FRAMES)
+    FRAMES.mkdir(parents=True, exist_ok=True)
+
     for i in range(total):
         t = i / fps
+        bg = preloaded_bg[i % len(preloaded_bg)].copy()
 
-        bg_path = downloaded[i % len(downloaded)]
-        try:
-            bg = safe_open_image(bg_path).resize((w, h))
-        except Exception:
-            bg = Image.fromarray(np.random.randint(0, 255, (h, w, 3), dtype=np.uint8))
-
-        if random.random() < 0.4:
+        # tiny motion without re-decoding
+        if random.random() < 0.40:
             bg = ImageChops.offset(bg, random.randint(-4, 4), random.randint(-3, 3))
 
         sc = scene_at(t)
         if sc == "NORMAL":
-            frame = bg.copy()
+            frame = bg
         elif sc == "MISSING":
             frame = Image.blend(bg, missing, 0.78)
         elif sc == "ENTITY":
             frame = Image.blend(bg, entity, 0.82)
         elif sc == "TRAFFIC":
-            frame = bg.copy()
+            frame = bg
             d = ImageDraw.Draw(frame)
             d.rectangle((50, 120, w - 50, 280), fill=(0, 0, 0))
             d.text((70, 150), "TRAFFIC & WEATHER SERVICE", font=pick_font(34), fill=(180, 255, 240))
@@ -470,33 +461,29 @@ def render_video(config):
         x = int(w - ((t * 140) % (w + 2200)))
         draw.text((x, h - 36), crawl, font=pick_font(20), fill=(220, 255, 245))
 
-        # random glitches
+        # glitches
         if random.random() < 0.08:
             frame = tracking_tear(frame)
-        if random.random() < 0.22:
-            frame = frame.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.0, 1.2)))
+        if random.random() < 0.20:
+            frame = frame.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.0, 1.0)))
 
         # VHS pass
-        if random.random() < 0.6:
+        if random.random() < 0.55:
             frame = chroma_shift(frame, px=int(config.get("chroma_shift_px", 3)))
         frame = add_scanlines(frame, alpha=float(config.get("scanline_alpha", 0.16)))
         frame = add_noise(frame, amount=float(config.get("vhs_noise", 0.12)))
         frame = vhs_overlay(frame, t, fps, label="CH-03")
 
-        frame.save(FRAMES / f"frame_{i:05d}.png")
+        # JPEG frames (fast)
+        frame.save(FRAMES / f"frame_{i:05d}.jpg", quality=82, subsampling=2)
 
-    # assemble audio & video
-    OUTPUT.mkdir(parents=True, exist_ok=True)
-    out_path = OUTPUT / f"arg_{stamp}_{seed}.mp4"
-
-    tmp_vid = WORK / "temp_video.mp4"
+    # audio build (same features, low overhead)
     bed = WORK / "bed.wav"
     voice = WORK / "voice.wav"
     mix = WORK / "mix.wav"
     jump = WORK / "jump.wav"
     final_audio = WORK / "final_audio.wav"
 
-    # audio bed
     run([
         "ffmpeg", "-y",
         "-f", "lavfi", "-i", f"anoisesrc=color=pink:duration={dur}",
@@ -506,7 +493,7 @@ def render_video(config):
         str(bed)
     ])
 
-    # tts (optional)
+    # TTS (keep feature, skip if espeak-ng missing)
     tts_ok = False
     if bool(config.get("tts_enabled", True)):
         script_lines = [
@@ -522,6 +509,7 @@ def render_video(config):
         except Exception:
             tts_ok = False
 
+    audio_in = bed
     if tts_ok:
         run([
             "ffmpeg", "-y",
@@ -530,10 +518,7 @@ def render_video(config):
             str(mix)
         ])
         audio_in = mix
-    else:
-        audio_in = bed
 
-    # jumpscare burst
     run([
         "ffmpeg", "-y",
         "-f", "lavfi", "-i", "anoisesrc=color=white:duration=0.35",
@@ -552,16 +537,21 @@ def render_video(config):
         str(final_audio)
     ])
 
-    # assemble video
+    # encode video faster
+    tmp_vid = WORK / "temp_video.mp4"
+    out_path = OUTPUT / f"arg_{stamp}_{seed}.mp4"
+
     run([
         "ffmpeg", "-y",
         "-framerate", str(fps),
-        "-i", str(FRAMES / "frame_%05d.png"),
-        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-preset", "medium",
+        "-i", str(FRAMES / "frame_%05d.jpg"),
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "22",
+        "-pix_fmt", "yuv420p",
         str(tmp_vid)
     ])
 
-    # mux audio
     run([
         "ffmpeg", "-y",
         "-i", str(tmp_vid),
@@ -582,4 +572,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
