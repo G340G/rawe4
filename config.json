@@ -1,0 +1,21 @@
+{
+  "fps": 24,
+  "duration_sec": 42,
+  "width": 960,
+  "height": 720,
+
+  "location_name": "Rome, IT",
+  "lat": 41.9028,
+  "lon": 12.4964,
+
+  "fetch_images": 10,
+  "fetch_text_snippets": 8,
+
+  "jumpscare_time_sec": 34.0,
+
+  "vhs_noise": 0.12,
+  "scanline_alpha": 0.16,
+  "chroma_shift_px": 3,
+
+  "tts_enabled": true
+}
