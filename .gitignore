@@ -1,0 +1,7 @@
+_arg_work/
+output/
+*.mp4
+*.wav
+*.aac
+.DS_Store
+__pycache__/
