@@ -1,31 +1,47 @@
-name: Render ARG video
+name: Render ARG video (fast)
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 3 * * 1"   # every Monday 03:00 UTC (change as you like)
+    # Every Monday 03:00 UTC (adjust if you want)
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arg-render
+  cancel-in-progress: false
 
 jobs:
-  build:
+  render:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install system deps
+      - name: System deps
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg espeak-ng fonts-dejavu-core
+          sudo apt-get install -y --no-install-recommends \
+            ffmpeg espeak-ng fonts-dejavu-core
+          ffmpeg -version
+          espeak-ng --version || true
 
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install Python deps
         run: pip install -r requirements.txt
 
       - name: Render video
+        env:
+          PYTHONUNBUFFERED: "1"
         run: |
           python arg_video.py
           ls -lah output
@@ -35,3 +51,5 @@ jobs:
         with:
           name: arg-video
           path: output/*.mp4
+          if-no-files-found: error
+
