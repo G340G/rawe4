@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 import os
 import json
-import math
 import random
 import shutil
 import subprocess
@@ -11,7 +10,10 @@ from pathlib import Path
 
 import requests
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter, ImageChops, ImageOps
+from PIL import (
+    Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter, ImageChops, ImageOps,
+    UnidentifiedImageError
+)
 
 ROOT = Path(__file__).parent
 WORK = ROOT / "_arg_work"
@@ -20,42 +22,51 @@ FRAMES = WORK / "frames"
 OUTPUT = ROOT / "output"
 
 CONFIG_PATH = ROOT / "config.json"
-
 USER_IMAGE = ROOT / "user_image.png"  # optional
 
 WIKIMEDIA_API = "https://commons.wikimedia.org/w/api.php"
 WIKI_RANDOM_SUMMARY = "https://en.wikipedia.org/api/rest_v1/page/random/summary"
 OPEN_METEO = "https://api.open-meteo.com/v1/forecast"
 
+
 # -----------------------------
-# helpers
+# OS / subprocess helpers
 # -----------------------------
 def run(cmd: list[str]) -> None:
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
-        raise RuntimeError(f"Command failed:\n{cmd}\n\n{p.stderr[:1200]}")
+        raise RuntimeError(f"Command failed:\n{cmd}\n\n{p.stderr[:1600]}")
 
-def safe_get(url, params=None, timeout=20):
-    r = requests.get(url, params=params, timeout=timeout, headers={"User-Agent": "arg-analogue-horror/1.0"})
+
+def safe_get(url, params=None, timeout=25):
+    r = requests.get(
+        url,
+        params=params,
+        timeout=timeout,
+        headers={"User-Agent": "arg-analogue-horror/1.0 (github actions)"},
+        allow_redirects=True
+    )
     r.raise_for_status()
     return r
+
 
 def ensure_dirs():
     for d in (WORK, ASSETS, FRAMES, OUTPUT):
         d.mkdir(parents=True, exist_ok=True)
 
+
 def load_config():
     with open(CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)
 
+
 def now_seed():
-    # Different every run, deterministic per run
     stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
-    seed = int(stamp[-8:]) ^ random.randint(0, 2**31 - 1)
+    seed = (int(stamp[-8:]) ^ random.randint(0, 2**31 - 1)) & 0xFFFFFFFF
     return stamp, seed
 
+
 def pick_font(size=22):
-    # DejaVu is usually available on Linux runners
     candidates = [
         "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -65,56 +76,87 @@ def pick_font(size=22):
             return ImageFont.truetype(c, size=size)
     return ImageFont.load_default()
 
+
 # -----------------------------
-# online fetch: permissive-ish
+# Online fetch (safe-ish sources)
 # -----------------------------
-def fetch_wikimedia_images(n=8):
+def fetch_wikimedia_images(n=10):
     """
-    Fetch random Commons files + filter by usable licenses using extmetadata.
-    This avoids “scrape everything” chaos.
+    Fetch random Wikimedia Commons File pages and keep only permissive-ish licenses
+    AND only file types we can actually use in the pipeline.
     """
     imgs = []
     tries = 0
-    while len(imgs) < n and tries < n * 6:
+    while len(imgs) < n and tries < n * 8:
         tries += 1
         params = {
             "action": "query",
             "format": "json",
             "generator": "random",
-            "grnnamespace": 6,  # File:
+            "grnnamespace": 6,   # File:
             "grnlimit": 1,
             "prop": "imageinfo",
-            "iiprop": "url|extmetadata",
+            "iiprop": "url|mime|extmetadata",
         }
         data = safe_get(WIKIMEDIA_API, params=params).json()
         pages = (data.get("query") or {}).get("pages") or {}
         for _, page in pages.items():
             ii = (page.get("imageinfo") or [{}])[0]
             url = ii.get("url")
-            meta = (ii.get("extmetadata") or {})
+            mime = (ii.get("mime") or "").lower()
+            meta = ii.get("extmetadata") or {}
             lic = (meta.get("LicenseShortName") or {}).get("value", "")
-            # permissive-ish licenses; adjust to taste
-            allowed = any(x in lic for x in ["CC0", "Public domain", "CC BY", "CC-BY", "CC BY-SA"])
-            if url and allowed:
-                imgs.append({"url": url, "license": lic})
+
+            # license allowlist (you can tweak)
+            allowed_license = any(x in lic for x in ["CC0", "Public domain", "CC BY", "CC-BY", "CC BY-SA", "CC-BY-SA"])
+
+            # file type allowlist: keep only things we can reliably open with Pillow on CI
+            # (SVG/TIFF often break; WEBP is usually OK, but depends on Pillow build—CI usually supports it.)
+            allowed_mime = any(x in mime for x in ["image/jpeg", "image/png", "image/webp"])
+
+            if url and allowed_license and allowed_mime:
+                imgs.append({"url": url, "license": lic, "mime": mime})
     return imgs
 
-def download_image(url, out_path: Path):
-    r = safe_get(url, timeout=25)
+
+def download_image(url: str, out_path: Path) -> None:
+    """
+    Download an image and validate it's actually decodable (not HTML, not error page).
+    """
+    r = safe_get(url, timeout=30)
+    ctype = (r.headers.get("Content-Type") or "").lower()
+
+    # guard against being served HTML/JSON error pages
+    if "text/html" in ctype or "application/json" in ctype:
+        raise RuntimeError(f"Non-image response for {url} (Content-Type={ctype})")
+
     out_path.write_bytes(r.content)
 
-def fetch_wikipedia_snippets(n=6):
+    # validate image readability
+    try:
+        with Image.open(out_path) as im:
+            im.verify()
+    except Exception as e:
+        try:
+            out_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise RuntimeError(f"Downloaded file is not a readable image: {url} -> {e}")
+
+
+def fetch_wikipedia_snippets(n=8):
     snippets = []
     for _ in range(n):
         try:
             j = safe_get(WIKI_RANDOM_SUMMARY, timeout=20).json()
-            title = j.get("title") or "UNTITLED"
+            title = (j.get("title") or "UNTITLED").strip()
             extract = (j.get("extract") or "").strip()
             if extract:
                 snippets.append(f"{title}: {extract}")
         except Exception:
             continue
     return snippets
+
 
 def fetch_weather(lat, lon):
     params = {
@@ -130,14 +172,16 @@ def fetch_weather(lat, lon):
         "code": cur.get("weather_code", "?")
     }
 
+
 def pseudo_traffic(seed):
     random.seed(seed ^ 0xA11CE)
     roads = ["TRANSIT RD", "WALDEN AVE", "BROADWAY", "I-90", "RING ROAD", "VIA NAZIONALE", "VIA DEL CORSO"]
     states = ["CLEAR", "SLOW", "STOP/GO", "INCIDENT", "LANE CLOSED", "LOW VISIBILITY"]
     return f"TRAFFIC: {random.choice(roads)} {random.choice(states)} ({random.randint(5,45)} MIN DELAY)"
 
+
 # -----------------------------
-# VHS / glitch visuals
+# VHS / glitch effects
 # -----------------------------
 def add_scanlines(img: Image.Image, alpha=0.15):
     w, h = img.size
@@ -148,11 +192,13 @@ def add_scanlines(img: Image.Image, alpha=0.15):
         d.line([(0, y), (w, y)], fill=(0, 0, 0, a))
     return Image.alpha_composite(img.convert("RGBA"), overlay).convert("RGB")
 
+
 def add_noise(img: Image.Image, amount=0.10):
     arr = np.array(img).astype(np.int16)
     n = np.random.normal(0, 255 * amount, size=arr.shape).astype(np.int16)
     out = np.clip(arr + n, 0, 255).astype(np.uint8)
     return Image.fromarray(out)
+
 
 def chroma_shift(img: Image.Image, px=2):
     r, g, b = img.split()
@@ -160,49 +206,50 @@ def chroma_shift(img: Image.Image, px=2):
     b = ImageChops.offset(b, -px, 0)
     return Image.merge("RGB", (r, g, b))
 
+
 def tracking_tear(img: Image.Image):
     w, h = img.size
     y = random.randint(80, h - 120)
-    band_h = random.randint(20, 80)
+    band_h = random.randint(18, 80)
     dx = random.randint(-40, 40)
     band = img.crop((0, y, w, y + band_h))
     img.paste(band, (dx, y))
     return img
 
+
 def vhs_overlay(img: Image.Image, t, fps, label="CH-03"):
     w, h = img.size
     draw = ImageDraw.Draw(img)
     f1 = pick_font(18)
-    f2 = pick_font(22)
 
-    # HUD background
-    draw.rectangle((14, 14, 360, 125), fill=(0, 0, 0, 120), outline=(60, 255, 220))
-    # fake timecode
+    draw.rectangle((14, 14, 380, 135), fill=(0, 0, 0))
     sec = int(t)
     frame = int((t - sec) * fps)
     timecode = f"{(sec//3600)%24:02d}:{(sec//60)%60:02d}:{sec%60:02d}:{frame:02d}"
+
     signal = random.randint(18, 99)
     bitrate = random.randint(120, 520)
+    err = random.randint(1, 9) if random.random() < 0.10 else 0
 
     lines = [
         "REC   VCR:PLAY",
         f"TC {timecode}  {label}",
         f"SIGNAL {signal}%   BITRATE {bitrate}kbps",
-        f"ERR {random.randint(0,9) if random.random()<0.1 else 0}",
+        f"ERR {err}",
     ]
     y = 26
     for s in lines:
         draw.text((28, y), s, font=f1, fill=(200, 255, 245))
-        y += 24
-
-    # bottom crawl strip space is handled elsewhere
+        y += 26
     return img
+
 
 def wrap_text(s, width=56):
     return textwrap.fill(s, width=width)
 
+
 # -----------------------------
-# cards / scenes
+# Cards / scenes
 # -----------------------------
 def make_card(w, h, title, body, danger=False):
     img = Image.new("RGB", (w, h), (5, 8, 10))
@@ -220,35 +267,40 @@ def make_card(w, h, title, body, danger=False):
         y += 30
     return img
 
+
+def safe_open_image(path: Path) -> Image.Image:
+    """
+    Open an image robustly. If it's broken, raise.
+    """
+    with Image.open(path) as im:
+        return im.convert("RGB")
+
+
 def missing_person_card(w, h, face_img: Image.Image, seed, location_name="UNKNOWN"):
     bg = Image.new("RGB", (w, h), (2, 5, 6))
     draw = ImageDraw.Draw(bg)
     f_big = pick_font(60)
     f = pick_font(22)
 
-    # poster
     draw.rectangle((60, 90, w - 60, h - 90), fill=(0, 0, 0), outline=(255, 90, 140), width=4)
     draw.text((90, 130), "MISSING", font=f_big, fill=(255, 90, 140))
 
-    # photo box
     draw.rectangle((90, 220, 360, 560), fill=(10, 18, 18), outline=(120, 255, 220), width=2)
     face = face_img.copy().convert("RGB").resize((270, 340))
     face = ImageEnhance.Contrast(face).enhance(1.15)
     face = face.filter(ImageFilter.GaussianBlur(radius=0.6))
     bg.paste(face, (90, 220))
 
-    # info
     random.seed(seed ^ 0xBADA55)
     age = random.randint(17, 23)
     last_seen = random.choice(["TRANSIT RD", "PARK ACCESS", "BUS STOP", "NEAR WALDEN", "NEAR STATION"])
-    contact = "REPORT IMMEDIATELY"
 
     lines = [
         ("NAME", "J. DOE (UNCONFIRMED)"),
         ("AGE", str(age)),
         ("LAST SEEN", f"{last_seen} / {location_name}"),
         ("CLOTHING", "COSTUME / UNKNOWN"),
-        ("CONTACT", contact),
+        ("CONTACT", "REPORT IMMEDIATELY"),
     ]
     y = 250
     for k, v in lines:
@@ -259,61 +311,69 @@ def missing_person_card(w, h, face_img: Image.Image, seed, location_name="UNKNOW
     draw.text((90, 595), "DO NOT APPROACH. DO NOT OFFER A RIDE.", font=f, fill=(255, 90, 140))
     return bg
 
-def weather_traffic_crawl(w, h, weather, traffic):
-    # returns a single line; scroll it during render
+
+def weather_traffic_crawl(weather, traffic):
     wx = f"WEATHER: {weather['temp']}C  WIND {weather['wind']}km/h  CODE {weather['code']}"
     return f"{wx}   |   {traffic}   |   REMINDER: LOCK DOORS   |"
 
+
 # -----------------------------
-# rendering
+# Main render
 # -----------------------------
 def render_video(config):
     ensure_dirs()
 
     stamp, seed = now_seed()
     random.seed(seed)
-    np.random.seed(seed & 0xFFFFFFFF)
+    np.random.seed(seed)
 
     fps = int(config["fps"])
     dur = float(config["duration_sec"])
     w, h = int(config["width"]), int(config["height"])
     total = int(dur * fps)
 
-    # clean frames
-    if FRAMES.exists():
-        shutil.rmtree(FRAMES)
-    FRAMES.mkdir(parents=True, exist_ok=True)
+    # fresh work dir each run
+    if WORK.exists():
+        shutil.rmtree(WORK)
+    ensure_dirs()
 
     # online content
     weather = fetch_weather(config["lat"], config["lon"])
     traffic = pseudo_traffic(seed)
-    crawl = weather_traffic_crawl(w, h, weather, traffic)
-    snippets = fetch_wikipedia_snippets(config["fetch_text_snippets"])
+    crawl = weather_traffic_crawl(weather, traffic)
+    snippets = fetch_wikipedia_snippets(int(config.get("fetch_text_snippets", 8)))
 
-    img_meta = fetch_wikimedia_images(config["fetch_images"])
-    downloaded = []
+    img_meta = fetch_wikimedia_images(int(config.get("fetch_images", 10)))
+
+    downloaded: list[Path] = []
     for i, m in enumerate(img_meta):
-        p = ASSETS / f"img_{i:02d}.jpg"
+        url = m["url"]
+        # keep original extension if we can
+        ext = os.path.splitext(url.split("?")[0])[1].lower()
+        if ext not in [".jpg", ".jpeg", ".png", ".webp"]:
+            # fallback extension doesn't matter; we validate after download anyway
+            ext = ".jpg"
+        out_path = ASSETS / f"img_{i:02d}{ext}"
         try:
-            download_image(m["url"], p)
-            downloaded.append(p)
+            download_image(url, out_path)
+            downloaded.append(out_path)
         except Exception:
             continue
+
     if not downloaded:
-        # fallback: generate a blank noise image
-        img = Image.fromarray(np.random.randint(0,255,(h,w,3),dtype=np.uint8))
-        p = ASSETS / "fallback.jpg"
-        img.save(p)
+        # hard fallback: generate a noise image
+        noise = Image.fromarray(np.random.randint(0, 255, (h, w, 3), dtype=np.uint8))
+        p = ASSETS / "fallback.png"
+        noise.save(p)
         downloaded = [p]
 
-    # optional user image
+    # choose face source
     if USER_IMAGE.exists():
         base_face = Image.open(USER_IMAGE).convert("RGB")
     else:
-        base_face = Image.open(downloaded[0]).convert("RGB")
+        base_face = safe_open_image(downloaded[0])
 
-    # scene cards
-    missing = missing_person_card(w, h, base_face, seed, config["location_name"])
+    missing = missing_person_card(w, h, base_face, seed, config.get("location_name", "UNKNOWN"))
     entity = make_card(
         w, h,
         "PUBLIC SAFETY BULLETIN",
@@ -332,8 +392,8 @@ def render_video(config):
         danger=False
     )
 
-    # choose timeline beats
-    jumpscare_t = float(config["jumpscare_time_sec"])
+    jumpscare_t = float(config.get("jumpscare_time_sec", 34.0))
+
     def scene_at(t):
         if t < 8.0:
             return "NORMAL"
@@ -349,35 +409,40 @@ def render_video(config):
             return "ERROR"
         return "END"
 
-    # pre-make a nasty jumpscare frame
+    def open_any_valid(paths: list[Path]) -> Image.Image:
+        for p in reversed(paths):
+            try:
+                return safe_open_image(p)
+            except Exception:
+                continue
+        return Image.fromarray(np.random.randint(0, 255, (h, w, 3), dtype=np.uint8))
+
     def make_jumpscare():
-        img = Image.open(downloaded[-1]).convert("RGB").resize((w, h))
+        img = open_any_valid(downloaded).resize((w, h))
         img = ImageEnhance.Contrast(img).enhance(2.2)
-        img = ImageEnhance.Color(img).enhance(0.2)
+        img = ImageEnhance.Color(img).enhance(0.15)
         img = img.filter(ImageFilter.DETAIL)
-        # invert + posterize for ugliness
-        img = ImageOps.invert(img)
+        img = ImageOps.invert(img.convert("RGB"))
         img = ImageOps.posterize(img, bits=3)
-        # add “LOOK AWAY”
         d = ImageDraw.Draw(img)
-        d.text((60, h//2 - 40), "LOOK AWAY", font=pick_font(92), fill=(255, 90, 140))
+        d.text((60, h // 2 - 40), "LOOK AWAY", font=pick_font(92), fill=(255, 90, 140))
         return img
 
     jumpscare = make_jumpscare()
 
-    # rendering loop
+    # render frames
     for i in range(total):
         t = i / fps
 
-        # pick background image and animate slight zoom/pan
         bg_path = downloaded[i % len(downloaded)]
-        bg = Image.open(bg_path).convert("RGB").resize((w, h))
+        try:
+            bg = safe_open_image(bg_path).resize((w, h))
+        except Exception:
+            bg = Image.fromarray(np.random.randint(0, 255, (h, w, 3), dtype=np.uint8))
 
-        # subtle motion
         if random.random() < 0.4:
-            bg = ImageChops.offset(bg, random.randint(-4,4), random.randint(-3,3))
+            bg = ImageChops.offset(bg, random.randint(-4, 4), random.randint(-3, 3))
 
-        # scenes
         sc = scene_at(t)
         if sc == "NORMAL":
             frame = bg.copy()
@@ -386,13 +451,12 @@ def render_video(config):
         elif sc == "ENTITY":
             frame = Image.blend(bg, entity, 0.82)
         elif sc == "TRAFFIC":
-            # show snippets as “unrelated info”
             frame = bg.copy()
             d = ImageDraw.Draw(frame)
-            d.rectangle((50, 120, w-50, 260), fill=(0,0,0))
-            d.text((70, 150), "TRAFFIC & WEATHER SERVICE", font=pick_font(34), fill=(180,255,240))
+            d.rectangle((50, 120, w - 50, 280), fill=(0, 0, 0))
+            d.text((70, 150), "TRAFFIC & WEATHER SERVICE", font=pick_font(34), fill=(180, 255, 240))
             s = snippets[i % max(1, len(snippets))] if snippets else "NO DATA"
-            d.text((70, 210), wrap_text(s, 78)[:240], font=pick_font(18), fill=(210,255,245))
+            d.text((70, 210), wrap_text(s, 78)[:420], font=pick_font(18), fill=(210, 255, 245))
         elif sc == "JUMP":
             frame = jumpscare.copy()
         elif sc == "ERROR":
@@ -400,38 +464,39 @@ def render_video(config):
         else:
             frame = Image.blend(bg, endcard, 0.82)
 
-        # crawl ticker
+        # ticker crawl
         draw = ImageDraw.Draw(frame)
-        draw.rectangle((0, h-48, w, h), fill=(0,0,0))
+        draw.rectangle((0, h - 48, w, h), fill=(0, 0, 0))
         x = int(w - ((t * 140) % (w + 2200)))
-        draw.text((x, h-36), crawl, font=pick_font(20), fill=(220,255,245))
+        draw.text((x, h - 36), crawl, font=pick_font(20), fill=(220, 255, 245))
 
-        # random glitch events
+        # random glitches
         if random.random() < 0.08:
             frame = tracking_tear(frame)
         if random.random() < 0.22:
             frame = frame.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.0, 1.2)))
 
-        # VHS processing
+        # VHS pass
         if random.random() < 0.6:
-            frame = chroma_shift(frame, px=int(config["chroma_shift_px"]))
-        frame = add_scanlines(frame, alpha=float(config["scanline_alpha"]))
-        frame = add_noise(frame, amount=float(config["vhs_noise"]))
-
+            frame = chroma_shift(frame, px=int(config.get("chroma_shift_px", 3)))
+        frame = add_scanlines(frame, alpha=float(config.get("scanline_alpha", 0.16)))
+        frame = add_noise(frame, amount=float(config.get("vhs_noise", 0.12)))
         frame = vhs_overlay(frame, t, fps, label="CH-03")
 
-        # save
         frame.save(FRAMES / f"frame_{i:05d}.png")
 
-    # audio: bed + optional tts + jumpscare burst
+    # assemble audio & video
     OUTPUT.mkdir(parents=True, exist_ok=True)
-    base = OUTPUT / f"arg_{stamp}_{seed}.mp4"
+    out_path = OUTPUT / f"arg_{stamp}_{seed}.mp4"
+
     tmp_vid = WORK / "temp_video.mp4"
     bed = WORK / "bed.wav"
     voice = WORK / "voice.wav"
     mix = WORK / "mix.wav"
+    jump = WORK / "jump.wav"
+    final_audio = WORK / "final_audio.wav"
 
-    # audio bed: hiss + drone
+    # audio bed
     run([
         "ffmpeg", "-y",
         "-f", "lavfi", "-i", f"anoisesrc=color=pink:duration={dur}",
@@ -441,9 +506,9 @@ def render_video(config):
         str(bed)
     ])
 
+    # tts (optional)
     tts_ok = False
     if bool(config.get("tts_enabled", True)):
-        # espeak-ng if available
         script_lines = [
             "This is a local emergency broadcast.",
             "Missing person notice. Do not approach.",
@@ -458,7 +523,6 @@ def render_video(config):
             tts_ok = False
 
     if tts_ok:
-        # mix bed + voice
         run([
             "ffmpeg", "-y",
             "-i", str(bed), "-i", str(voice),
@@ -469,9 +533,7 @@ def render_video(config):
     else:
         audio_in = bed
 
-    # add a jumpscare sound around jumpscare time
-    # (short noise burst mixed into audio)
-    jump = WORK / "jump.wav"
+    # jumpscare burst
     run([
         "ffmpeg", "-y",
         "-f", "lavfi", "-i", "anoisesrc=color=white:duration=0.35",
@@ -479,7 +541,6 @@ def render_video(config):
         str(jump)
     ])
 
-    final_audio = WORK / "final_audio.wav"
     run([
         "ffmpeg", "-y",
         "-i", str(audio_in),
@@ -508,18 +569,17 @@ def render_video(config):
         "-c:v", "copy",
         "-c:a", "aac",
         "-shortest",
-        str(base)
+        str(out_path)
     ])
 
-    print(f"OK: wrote {base}")
+    print(f"OK: wrote {out_path}")
+
 
 def main():
     config = load_config()
-    # clean work dir each run to keep artifacts fresh
-    if WORK.exists():
-        shutil.rmtree(WORK)
-    ensure_dirs()
     render_video(config)
+
 
 if __name__ == "__main__":
     main()
+
