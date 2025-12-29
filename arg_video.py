@@ -11,7 +11,7 @@ from pathlib import Path
 
 import requests
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter, ImageChops
+from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageFilter, ImageChops, ImageOps
 
 ROOT = Path(__file__).parent
 WORK = ROOT / "_arg_work"
