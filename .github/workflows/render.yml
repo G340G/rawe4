@@ -1,0 +1,37 @@
+name: Render ARG video
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"   # every Monday 03:00 UTC (change as you like)
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg espeak-ng fonts-dejavu-core
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      - name: Render video
+        run: |
+          python arg_video.py
+          ls -lah output
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: arg-video
+          path: output/*.mp4
