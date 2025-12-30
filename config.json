@@ -4,12 +4,12 @@
   "width": 960,
   "height": 720,
 
-  "location_name": "Rome, IT",
+  "location_name": "LOCAL AREA",
   "lat": 41.9028,
   "lon": 12.4964,
 
-  "fetch_images": 10,
-  "fetch_text_snippets": 8,
+  "fetch_images": 6,
+  "fetch_text_snippets": 6,
 
   "jumpscare_time_sec": 34.0,
 
@@ -17,5 +17,43 @@
   "scanline_alpha": 0.16,
   "chroma_shift_px": 3,
 
-  "tts_enabled": true
+  "tts_enabled": true,
+
+  "personalization": {
+    "enabled": true,
+    "missing_name": "J. DOE (UNCONFIRMED)",
+    "missing_age_range": [17, 22],
+    "last_seen": "NEAR TRANSIT RD / WALDEN",
+    "contact_line": "REPORT IMMEDIATELY",
+    "entity_name": "UNKNOWN ENTITY",
+    "entity_rules": [
+      "DO NOT SPEAK.",
+      "DO NOT FOLLOW.",
+      "DO NOT ACKNOWLEDGE IT.",
+      "LEAVE THE AREA IMMEDIATELY.",
+      "GO TO A LIT LOCATION."
+    ],
+    "tts_lines": [
+      "This is a local emergency broadcast.",
+      "Missing person notice. Do not approach.",
+      "Be aware of an unknown entity lingering near low light roads.",
+      "If encountered: do not speak. Do not follow. Leave the area immediately.",
+      "Report immediately. End of transmission."
+    ]
+  },
+
+  "user_assets": {
+    "use_user_images": true,
+    "user_face": "user_image.png",
+    "user_bg": "user_bg.png",
+    "user_logo": "user_logo.png",
+    "custom_text_file": "custom_lines.txt"
+  },
+
+  "style_mix": {
+    "use_crude_html_style": true,
+    "crude_html_weight": 0.45,
+    "scraped_weight": 0.55
+  }
 }
+
